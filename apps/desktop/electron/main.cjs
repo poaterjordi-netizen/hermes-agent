@@ -43,7 +43,6 @@ const { dashboardFallbackArgs, sourceDeclaresServe } = require('./backend-comman
 const { serializeJsonBody, setJsonRequestHeaders } = require('./oauth-net-request.cjs')
 const { buildDesktopBackendEnv, normalizeHermesHomeRoot } = require('./backend-env.cjs')
 const { readWindowsUserEnvVar } = require('./windows-user-env.cjs')
-const { readWslWindowsClipboardImage } = require('./wsl-clipboard-image.cjs')
 const { nativeOverlayWidth: computeNativeOverlayWidth } = require('./titlebar-overlay-width.cjs')
 const { readLiveUpdateMarker } = require('./update-marker.cjs')
 const {
@@ -64,6 +63,7 @@ const { registerProjectDirIpc } = require('./project-dir-ipc.cjs')
 const { registerVscodeThemeIpc } = require('./vscode-theme-ipc.cjs')
 const { registerUninstallIpc } = require('./uninstall-ipc.cjs')
 const { registerVersionIpc } = require('./version-ipc.cjs')
+const { registerMediaIpc } = require('./media-ipc.cjs')
 const { OFFICIAL_REPO_HTTPS_URL, isOfficialSshRemote } = require('./update-remote.cjs')
 const { resolveBehindCount, shouldCountCommits } = require('./update-count.cjs')
 const { runRebuildWithRetry } = require('./update-rebuild.cjs')
@@ -100,9 +100,7 @@ const {
   tokenPreview
 } = require('./connection-config.cjs')
 const {
-  DATA_URL_READ_MAX_BYTES,
   DEFAULT_FETCH_TIMEOUT_MS,
-  TEXT_PREVIEW_SOURCE_MAX_BYTES,
   encryptDesktopSecret: encryptDesktopSecretStrict,
   resolveReadableFileForIpc,
   resolveRequestedPathForIpc,
@@ -6507,98 +6505,18 @@ ipcMain.handle('hermes:notify', (_event, payload) => {
   return true
 })
 
-ipcMain.handle('hermes:readFileDataUrl', async (_event, filePath) => {
-  const { resolvedPath } = await resolveReadableFileForIpc(filePath, {
-    maxBytes: DATA_URL_READ_MAX_BYTES,
-    purpose: 'File preview'
-  })
-  const data = await fs.promises.readFile(resolvedPath)
-  return `data:${mimeTypeForPath(resolvedPath)};base64,${data.toString('base64')}`
-})
-
-ipcMain.handle('hermes:readFileText', async (_event, filePath) => {
-  const { resolvedPath, stat } = await resolveReadableFileForIpc(filePath, {
-    maxBytes: TEXT_PREVIEW_SOURCE_MAX_BYTES,
-    purpose: 'Text preview'
-  })
-  const ext = path.extname(resolvedPath).toLowerCase()
-  const handle = await fs.promises.open(resolvedPath, 'r')
-  const bytesToRead = Math.min(stat.size, TEXT_PREVIEW_MAX_BYTES)
-
-  try {
-    const buffer = Buffer.alloc(bytesToRead)
-    const { bytesRead } = await handle.read(buffer, 0, bytesToRead, 0)
-
-    return {
-      binary: looksBinary(buffer.subarray(0, Math.min(bytesRead, 4096))),
-      byteSize: stat.size,
-      language: PREVIEW_LANGUAGE_BY_EXT[ext] || 'text',
-      mimeType: mimeTypeForPath(resolvedPath),
-      path: resolvedPath,
-      text: buffer.subarray(0, bytesRead).toString('utf8'),
-      truncated: stat.size > TEXT_PREVIEW_MAX_BYTES
-    }
-  } finally {
-    await handle.close()
-  }
-})
-
-ipcMain.handle('hermes:selectPaths', async (_event, options = {}) => {
-  const properties = options?.directories ? ['openDirectory'] : ['openFile']
-  if (options?.multiple !== false) properties.push('multiSelections')
-
-  let resolvedDefaultPath
-  if (options?.defaultPath) {
-    try {
-      resolvedDefaultPath = path.resolve(String(options.defaultPath))
-    } catch {
-      resolvedDefaultPath = undefined
-    }
-  }
-
-  const result = await dialog.showOpenDialog(mainWindow, {
-    title: options?.title || 'Add context',
-    defaultPath: resolvedDefaultPath,
-    properties,
-    filters: Array.isArray(options?.filters) ? options.filters : undefined
-  })
-
-  if (result.canceled) return []
-  return result.filePaths
-})
-
-ipcMain.handle('hermes:writeClipboard', (_event, text) => {
-  clipboard.writeText(String(text || ''))
-  return true
-})
-
-ipcMain.handle('hermes:saveImageFromUrl', (_event, url) => saveImageFromUrl(String(url || '')))
-
-ipcMain.handle('hermes:saveImageBuffer', async (_event, payload) => {
-  const data = payload?.data
-  if (!data) throw new Error('saveImageBuffer: missing data')
-
-  const buffer = Buffer.isBuffer(data) ? data : Buffer.from(data)
-  return writeComposerImage(buffer, payload?.ext || '.png')
-})
-
-ipcMain.handle('hermes:saveClipboardImage', async () => {
-  const image = clipboard.readImage()
-  if (image && !image.isEmpty()) {
-    return writeComposerImage(image.toPNG(), '.png')
-  }
-
-  // WSL2/WSLg doesn't bridge clipboard *images* from the Windows host to the
-  // Linux clipboard Electron reads, so a host screenshot looks empty above.
-  // Pull it straight off the Windows clipboard via PowerShell as a fallback.
-  if (IS_WSL) {
-    const png = readWslWindowsClipboardImage()
-    if (png) {
-      return writeComposerImage(png, '.png')
-    }
-  }
-
-  return ''
+// File-preview/clipboard/image IPC lives in media-ipc.cjs; preview helpers,
+// image writers, and a live-main-window getter are injected.
+registerMediaIpc({
+  getMainWindow: () => mainWindow,
+  ipcMain,
+  IS_WSL,
+  looksBinary,
+  mimeTypeForPath,
+  PREVIEW_LANGUAGE_BY_EXT,
+  saveImageFromUrl,
+  TEXT_PREVIEW_MAX_BYTES,
+  writeComposerImage
 })
 
 ipcMain.handle('hermes:normalizePreviewTarget', (_event, target, baseDir) =>
