@@ -3206,6 +3206,85 @@ bundle_mode() {
     log_info "  Run: hermes setup       to configure providers."
 }
 
+# ─── Source mode: git clone + minimal venv + dev sync ─────────────────
+# The developer path. Clones the repo, creates a bare venv, then delegates
+# to 'hermes dev sync' for all provisioning (node deps, builds, etc.).
+# This replaces ~2000 lines of setup_venv + install_deps + node_deps +
+# web_build that install.sh used to carry — dev sync owns it all now.
+source_mode() {
+    log_info "Source install (developer mode)..."
+
+    # 1. Clone (or update) the repo
+    if [ -d "$INSTALL_DIR/.git" ]; then
+        log_info "Updating existing checkout at $INSTALL_DIR..."
+        cd "$INSTALL_DIR" || { log_error "Cannot cd to $INSTALL_DIR"; exit 1; }
+        git pull --ff-only origin "$BRANCH" || {
+            log_error "git pull failed. You may have local changes."
+            log_info "Run 'hermes update' to use the worktree-based update flow."
+            exit 1
+        }
+    else
+        log_info "Cloning hermes-agent into $INSTALL_DIR..."
+        mkdir -p "$(dirname "$INSTALL_DIR")"
+        git clone --depth 1 --branch "$BRANCH" "$REPO_URL_HTTPS" "$INSTALL_DIR" || {
+            log_error "git clone failed"
+            exit 1
+        }
+        cd "$INSTALL_DIR" || { log_error "Cannot cd to $INSTALL_DIR"; exit 1; }
+    fi
+
+    # 2. Create a minimal venv (dev sync will populate it)
+    if [ ! -f ".venv/bin/python" ]; then
+        log_info "Creating venv..."
+        if command -v uv >/dev/null 2>&1; then
+            uv venv .venv
+        elif command -v python3 >/dev/null 2>&1; then
+            python3 -m venv .venv
+        else
+            log_error "Neither uv nor python3 found. Install one of them first."
+            exit 1
+        fi
+    fi
+
+    # 3. Install hermes into the venv (editable, so dev sync works)
+    log_info "Installing hermes (editable)..."
+    if command -v uv >/dev/null 2>&1; then
+        uv pip install --python .venv/bin/python -e ".[all]" || {
+            log_error "uv pip install failed. Run 'hermes dev sync' manually."
+            exit 1
+        }
+    else
+        .venv/bin/pip install -e ".[all]" || {
+            log_error "pip install failed. Run 'hermes dev sync' manually."
+            exit 1
+        }
+    fi
+
+    # 4. Run dev sync to provision everything else (node deps, builds, etc.)
+    log_info "Running hermes dev sync..."
+    .venv/bin/hermes dev sync || {
+        log_error "dev sync failed. Run 'hermes dev sync' manually to retry."
+        log_info "The venv and source are set up — dev sync is idempotent."
+    }
+
+    # 5. Link the hermes command
+    local link_dir
+    link_dir=$(get_command_link_dir 2>/dev/null || echo "$HOME/.local/bin")
+    local launcher="$INSTALL_DIR/bin/hermes"
+    if [ ! -x "$launcher" ]; then
+        launcher="$INSTALL_DIR/.venv/bin/hermes"
+    fi
+    if [ -x "$launcher" ]; then
+        ln -sf "$launcher" "$link_dir/hermes"
+        log_success "hermes command linked at $link_dir/hermes"
+    fi
+
+    log_success "Source install complete!"
+    log_info "  Run: hermes --version  to verify."
+    log_info "  Run: hermes setup       to configure providers."
+    log_info "  Run: hermes dev sync    to re-provision after pulling new code."
+}
+
 if [ "$MANIFEST_MODE" = true ]; then
     emit_manifest
 elif [ -n "$STAGE_NAME" ]; then
@@ -3217,5 +3296,8 @@ elif [ "$POSTINSTALL_MODE" = true ]; then
 elif [ "$BUNDLE_MODE" = true ]; then
     bundle_mode
 else
-    main
+    # --source: developer path. Clone the repo, create a minimal venv,
+    # then run 'hermes dev sync' which provisions everything (node deps,
+    # builds, etc.) via the ArtifactStamp-gated provision verb.
+    source_mode
 fi

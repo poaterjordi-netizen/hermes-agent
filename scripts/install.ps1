@@ -3568,8 +3568,79 @@ try {
         exit $LASTEXITCODE
     }
 
-    # Source mode: full git-clone + venv + deps (developer path)
-    Main
+    # Source mode: git clone + minimal venv + dev sync (developer path)
+    # Delegates to 'hermes dev sync' for all provisioning — no duplicated
+    # venv/deps/build logic here.
+    Write-Banner
+    Write-Info "Source install (developer mode)..."
+
+    # Clone (or update) the repo
+    if (Test-Path "$InstallDir\.git") {
+        Write-Info "Updating existing checkout at $InstallDir..."
+        Push-Location $InstallDir
+        git pull --ff-only origin $Branch
+        if ($LASTEXITCODE -ne 0) {
+            Write-Err "git pull failed. You may have local changes."
+            Write-Info "Run 'hermes update' to use the worktree-based update flow."
+            Pop-Location
+            exit 1
+        }
+        Pop-Location
+    } else {
+        Write-Info "Cloning hermes-agent into $InstallDir..."
+        $parent = Split-Path $InstallDir -Parent
+        if (-not (Test-Path $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
+        git clone --depth 1 --branch $Branch "https://github.com/NousResearch/hermes-agent.git" $InstallDir
+        if ($LASTEXITCODE -ne 0) {
+            Write-Err "git clone failed"
+            exit 1
+        }
+    }
+
+    # Create a minimal venv (dev sync will populate it)
+    if (-not (Test-Path "$InstallDir\.venv\Scripts\python.exe")) {
+        Write-Info "Creating venv..."
+        Push-Location $InstallDir
+        if (Get-Command uv -ErrorAction SilentlyContinue) {
+            uv venv .venv
+        } else {
+            python -m venv .venv
+        }
+        if ($LASTEXITCODE -ne 0) {
+            Write-Err "venv creation failed"
+            Pop-Location
+            exit 1
+        }
+        Pop-Location
+    }
+
+    # Install hermes (editable) into the venv
+    Write-Info "Installing hermes (editable)..."
+    Push-Location $InstallDir
+    if (Get-Command uv -ErrorAction SilentlyContinue) {
+        uv pip install --python .venv\Scripts\python.exe -e ".[all]"
+    } else {
+        .venv\Scripts\pip.exe install -e ".[all]"
+    }
+    if ($LASTEXITCODE -ne 0) {
+        Write-Err "pip install failed. Run 'hermes dev sync' manually."
+        Pop-Location
+        exit 1
+    }
+    Pop-Location
+
+    # Run dev sync to provision everything else
+    Write-Info "Running hermes dev sync..."
+    & "$InstallDir\.venv\Scripts\hermes.exe" dev sync
+    if ($LASTEXITCODE -ne 0) {
+        Write-Err "dev sync failed. Run 'hermes dev sync' manually to retry."
+        Write-Info "The venv and source are set up — dev sync is idempotent."
+    }
+
+    Write-Info "Source install complete!"
+    Write-Info "  Run: hermes --version  to verify."
+    Write-Info "  Run: hermes setup       to configure providers."
+    Write-Info "  Run: hermes dev sync    to re-provision after pulling new code."
 } catch {
     if ($Json -or $Stage) {
         # Stage-driver mode: caller wants JSON they can parse.  Emit a
