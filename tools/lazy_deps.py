@@ -666,7 +666,16 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
         if uv_bin:
             try:
                 r = subprocess.run(
-                    [uv_bin, "pip", "install", *target_args, *constraint_args, *specs],
+                    [
+                        uv_bin,
+                        "pip",
+                        "install",
+                        "--python",
+                        sys.executable,
+                        *target_args,
+                        *constraint_args,
+                        *specs,
+                    ],
                     capture_output=True, text=True, timeout=timeout, env=uv_env,
                     stdin=subprocess.DEVNULL,
                 )

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { spawnSync } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
 
@@ -47,8 +48,9 @@ const app = await electron.launch({
     HERMES_DESKTOP_USER_DATA_DIR: userData
   }
 })
-app.process().stdout?.on('data', chunk => process.stderr.write(`[desktop stdout] ${chunk}`))
-app.process().stderr?.on('data', chunk => process.stderr.write(`[desktop stderr] ${chunk}`))
+const v1 = app.process()
+v1.stdout?.on('data', chunk => process.stderr.write(`[desktop stdout] ${chunk}`))
+v1.stderr?.on('data', chunk => process.stderr.write(`[desktop stderr] ${chunk}`))
 
 try {
   const page = await app.firstWindow({ timeout: 60_000 })
@@ -66,10 +68,10 @@ try {
   // cannot complete until the harness detaches. End v1 immediately after the
   // successful handoff so updater-owned v2 can acquire the single-instance
   // lock and relaunch normally.
-  const v1 = app.process()
   const v1Exited = new Promise(resolve => v1.once('exit', resolve))
   v1.kill('SIGKILL')
   await v1Exited
+  spawnSync('pkill', ['-KILL', '-f', v1Executable], { stdio: 'ignore' })
 
   await poll(
     () => fs.readFileSync(path.join(hermesHome, 'current.txt'), 'utf8').trim(),
@@ -87,7 +89,7 @@ try {
 } finally {
   // Closing this harness process releases Playwright's inspector pipe. The
   // updater-owned v2 process is separate and is cleaned by the shell harness.
-  app.process().kill('SIGKILL')
+  if (v1.exitCode === null) v1.kill('SIGKILL')
 }
 
 process.exit(0)
