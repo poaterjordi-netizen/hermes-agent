@@ -34,9 +34,9 @@ This is an implementation checklist, not a record that the phases are complete. 
   - Install scripts/adopt.py still trust exe+checksum from same origin (documented design limitation — the updater's signature verification is the real trust boundary once a trusted updater is installed).
   - Spec: `02-phase1-updater.md:115-125`; `03-phase2-compat-and-adoption.md:172-180`.
 
-- [ ] Record the desktop correctly in published manifests.
-  - Release CI builds desktop by default but omits `--desktop` when invoking `write-manifest.py`: `.github/workflows/release-bundles.yml:117-154`.
-  - Published manifests currently report `"desktop": false` even when `desktop/` exists.
+- [x] Record the desktop correctly in published manifests.
+  - `write_manifest()` now auto-detects `desktop/` directory presence when `desktop=None` (the default), so CI that builds desktop via `build-bundle.sh` produces correct manifests without needing `--desktop`.
+  - Tests: `test_desktop_auto_detected_when_dir_present` + `test_desktop_auto_detected_when_dir_absent`.
 
 - [ ] Make Node acquisition reproducible and integrity-checked.
   - `build-bundle.sh` scrapes `latest-v22.x` without verifying the Node archive checksum or recording the resolved full version in the bundle manifest.
