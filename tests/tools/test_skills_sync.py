@@ -296,6 +296,7 @@ class TestExternalDirsIndexing:
         from contextlib import ExitStack
         stack = ExitStack()
         stack.enter_context(patch("tools.skills_sync._get_bundled_dir", return_value=bundled))
+        stack.enter_context(patch("tools.skills_sync.HERMES_HOME", skills_dir.parent))
         stack.enter_context(patch("tools.skills_sync._get_optional_dir", return_value=bundled.parent / "optional-skills"))
         stack.enter_context(patch("tools.skills_sync.SKILLS_DIR", skills_dir))
         stack.enter_context(patch("tools.skills_sync.MANIFEST_FILE", manifest_file))
@@ -412,6 +413,7 @@ class TestSyncSkills:
         from contextlib import ExitStack
         stack = ExitStack()
         stack.enter_context(patch("tools.skills_sync._get_bundled_dir", return_value=bundled))
+        stack.enter_context(patch("tools.skills_sync.HERMES_HOME", skills_dir.parent))
         stack.enter_context(patch("tools.skills_sync._get_optional_dir", return_value=bundled.parent / "optional-skills"))
         stack.enter_context(patch("tools.skills_sync.SKILLS_DIR", skills_dir))
         stack.enter_context(patch("tools.skills_sync.MANIFEST_FILE", manifest_file))
@@ -830,7 +832,9 @@ class TestSyncSkills:
         assert not (skills_dir / ".hub" / "lock.json").exists()
 
     def test_nonexistent_bundled_dir(self, tmp_path):
-        with patch("tools.skills_sync._get_bundled_dir", return_value=tmp_path / "nope"):
+        with patch("tools.skills_sync.HERMES_HOME", tmp_path), patch(
+            "tools.skills_sync._get_bundled_dir", return_value=tmp_path / "nope"
+        ):
             result = sync_skills(quiet=True)
         assert result == {
             "copied": [], "updated": [], "skipped": 0,
@@ -968,6 +972,7 @@ class TestResetBundledSkill:
         from contextlib import ExitStack
         stack = ExitStack()
         stack.enter_context(patch("tools.skills_sync._get_bundled_dir", return_value=bundled))
+        stack.enter_context(patch("tools.skills_sync.HERMES_HOME", skills_dir.parent))
         stack.enter_context(patch("tools.skills_sync._get_optional_dir", return_value=bundled.parent / "optional-skills"))
         stack.enter_context(patch("tools.skills_sync.SKILLS_DIR", skills_dir))
         stack.enter_context(patch("tools.skills_sync.MANIFEST_FILE", manifest_file))
@@ -1308,6 +1313,7 @@ class TestUpdateBackupRecovery:
         from contextlib import ExitStack
         stack = ExitStack()
         stack.enter_context(patch("tools.skills_sync._get_bundled_dir", return_value=bundled))
+        stack.enter_context(patch("tools.skills_sync.HERMES_HOME", skills_dir.parent))
         stack.enter_context(patch("tools.skills_sync._get_optional_dir", return_value=bundled.parent / "optional-skills"))
         stack.enter_context(patch("tools.skills_sync.SKILLS_DIR", skills_dir))
         stack.enter_context(patch("tools.skills_sync.MANIFEST_FILE", manifest_file))

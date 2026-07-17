@@ -1487,6 +1487,16 @@ DEFAULT_CONFIG = {
                                       # after live validation.
     },
 
+    "session_auto_handoff": {
+        "enabled": False,
+        "low_watermark": 0.80,
+        "high_watermark": 0.90,
+        "max_handoff_chars": 24000,
+        "auto_continue": True,
+        "once_per_session": True,
+        "persist_to_session_db": True,
+    },
+
     # Kanban subsystem (orchestrator workers + dispatcher-driven child tasks).
     # See tools/kanban_tools.py and hermes_cli/kanban_db.py for the actual
     # implementations. Per-platform notification opt-out is handled by the

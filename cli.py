@@ -3695,6 +3695,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         # Initialize Rich console
         self.console = Console()
         self.config = CLI_CONFIG
+        _auto_handoff_cfg = CLI_CONFIG.get("session_auto_handoff", {})
+        self._auto_handoff_config = _auto_handoff_cfg if isinstance(_auto_handoff_cfg, dict) else {}
+        self._auto_handoff_triggered_sessions = set()
         self.compact = compact if compact is not None else CLI_CONFIG["display"].get("compact", False)
         # tool_progress: "off", "new", "all", "verbose" (from config.yaml display section)
         # YAML 1.1 parses bare `off` as boolean False — normalise to string.
@@ -6957,6 +6960,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 "Could not prune empty session %s", session_id, exc_info=True
             )
             return False
+
+    def _maybe_auto_handoff_after_turn(
+        self,
+        response: Optional[str],
+        result: Optional[Dict[str, Any]],
+    ) -> None:
+        """Best-effort CLI-only auto fresh-session handoff."""
+        try:
+            from hermes_cli.auto_handoff import perform_cli_auto_handoff
+            perform_cli_auto_handoff(self, response=response, result=result)
+        except Exception:
+            logger.debug("auto handoff post-turn hook failed", exc_info=True)
 
     def _launch_session_boundary_memory_flush(
         self,
@@ -12872,6 +12887,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 preview = _leftover_steer[:60] + ("..." if len(_leftover_steer) > 60 else "")
                 print(f"\n⏩ Delivering leftover /steer as next turn: '{preview}'")
                 self._pending_input.put(_leftover_steer)
+
+            self._maybe_auto_handoff_after_turn(response, result)
 
             return response
             
