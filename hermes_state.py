@@ -1101,6 +1101,7 @@ class SessionDB:
         # in place at most once per SessionDB instance so a genuinely
         # unrecoverable database can't put writers into a rebuild loop.
         self._fts_runtime_rebuild_attempted = False
+        self._last_foreground_write_at = 0.0
         self._fts_enabled = False
         self._trigram_available = False
         self._fts_unavailable_warned = False
@@ -1336,7 +1337,12 @@ class SessionDB:
                 self._warn_fts5_unavailable(exc)
             return False
 
-    def _execute_write(self, fn: Callable[[sqlite3.Connection], T]) -> T:
+    def _execute_write(
+        self,
+        fn: Callable[[sqlite3.Connection], T],
+        *,
+        _worker: bool = False,
+    ) -> T:
         """Execute a write transaction with BEGIN IMMEDIATE and jitter retry.
 
         *fn* receives the connection and should perform INSERT/UPDATE/DELETE
@@ -1349,8 +1355,15 @@ class SessionDB:
         random 20-150ms, and retry — breaking the convoy pattern that
         SQLite's built-in deterministic backoff creates.
 
+        ``_worker=True`` marks background-maintenance writes (the deferred
+        FTS rebuild). All other writes stamp ``_last_foreground_write_at``,
+        which the rebuild worker watches to yield while a user is active.
+
         Returns whatever *fn* returns.
         """
+        if not _worker:
+            # Plain float store is atomic under the GIL — no lock needed.
+            self._last_foreground_write_at = time.monotonic()
         last_err: Optional[Exception] = None
         for attempt in range(self._WRITE_MAX_RETRIES):
             try:
@@ -1542,9 +1555,28 @@ class SessionDB:
     #   - multiple processes sharing the DB don't double-run it — each chunk
     #     claims work by compare-and-swap on fts_rebuild_progress, so even a
     #     concurrent second worker just interleaves chunks safely.
+    #
+    # THROTTLING (the part that keeps live sessions responsive): an early
+    # 5000-row/50ms-pause version monopolized the write lock ~85% of the
+    # time and visibly froze concurrent CLI sessions on a large install.
+    # Three layers prevent that:
+    #   1. Small chunks (500 rows) — a foreground write queues behind a
+    #      chunk for at most ~tens of ms.
+    #   2. Adaptive duty cycle — the worker sleeps a multiple of each
+    #      chunk's measured cost, capping its share of DB bandwidth at
+    #      roughly 1/(1+_FTS_REBUILD_DUTY_FACTOR).
+    #   3. Foreground-yield — _execute_write stamps the wall clock on every
+    #      NON-worker write; while that stamp is fresh the worker crawls
+    #      (one chunk per _FTS_REBUILD_YIELD_PAUSE), so the rebuild runs at
+    #      full speed only in usage gaps (same idle-gating idea as the
+    #      curator). The rebuild takes longer in wall time; nobody is
+    #      waiting on it.
 
-    _FTS_REBUILD_CHUNK_ROWS = 5_000
-    _FTS_REBUILD_PAUSE_SECONDS = 0.05  # yield between chunks: writers first
+    _FTS_REBUILD_CHUNK_ROWS = 500
+    _FTS_REBUILD_DUTY_FACTOR = 4.0      # sleep >= 4x chunk cost (≤20% duty)
+    _FTS_REBUILD_MIN_PAUSE = 0.2        # seconds — floor between chunks
+    _FTS_REBUILD_YIELD_WINDOW = 10.0    # seconds — foreground considered active
+    _FTS_REBUILD_YIELD_PAUSE = 2.0      # seconds — crawl pace while yielding
 
     def fts_rebuild_status(self) -> Optional[Dict[str, Any]]:
         """Return deferred-rebuild progress, or None when no rebuild pending.
@@ -1565,13 +1597,43 @@ class SessionDB:
         return {"pending": True, "total": total, "indexed": progress, "percent": pct}
 
     def _fts_rebuild_finish(self) -> None:
-        """Clear rebuild markers (single transaction) once progress >= high water."""
+        """Finalize the deferred rebuild: boundary sweep + clear markers.
+
+        The sweep is cheap insurance against any write that slipped through
+        the migration-boundary instant (between high_water capture and
+        trigger activation): re-index any row near the boundary that the
+        index is missing. docsize has one row per indexed doc, so the
+        anti-join is exact and runs on a narrow id range.
+        """
         def _do(conn):
+            hw_row = conn.execute(
+                "SELECT value FROM state_meta WHERE key = 'fts_rebuild_high_water'"
+            ).fetchone()
+            if hw_row is not None:
+                hw = int(hw_row[0])
+                # Sweep a generous window around the boundary.
+                lo, hi = hw - 1000, hw + 1000
+                conn.execute(
+                    "INSERT INTO messages_fts(rowid, content, tool_name, tool_calls) "
+                    "SELECT m.id, m.content, m.tool_name, m.tool_calls "
+                    "FROM messages m "
+                    "WHERE m.id > ? AND m.id <= ? "
+                    "AND NOT EXISTS (SELECT 1 FROM messages_fts_docsize d WHERE d.id = m.id)",
+                    (lo, hi),
+                )
+                conn.execute(
+                    "INSERT INTO messages_fts_trigram(rowid, content, tool_name, tool_calls) "
+                    "SELECT m.id, m.content, m.tool_name, m.tool_calls "
+                    "FROM messages m "
+                    "WHERE m.id > ? AND m.id <= ? AND m.role <> 'tool' "
+                    "AND NOT EXISTS (SELECT 1 FROM messages_fts_trigram_docsize d WHERE d.id = m.id)",
+                    (lo, hi),
+                )
             conn.execute(
                 "DELETE FROM state_meta WHERE key IN "
                 "('fts_rebuild_high_water', 'fts_rebuild_progress')"
             )
-        self._execute_write(_do)
+        self._execute_write(_do, _worker=True)
         logger.info("Deferred FTS rebuild complete — all messages indexed.")
 
     # Demoted v22 FTS shadow tables awaiting teardown (see the v23 migration:
@@ -1618,7 +1680,7 @@ class SessionDB:
             return True  # re-check: more trash tables / chunks may remain
 
         try:
-            return bool(self._execute_write(_do))
+            return bool(self._execute_write(_do, _worker=True))
         except sqlite3.OperationalError as exc:
             logger.debug("FTS trash teardown chunk failed (will retry): %s", exc)
             return True
@@ -1680,7 +1742,7 @@ class SessionDB:
             return upper < high_water
 
         try:
-            more = self._execute_write(_do)
+            more = self._execute_write(_do, _worker=True)
         except sqlite3.OperationalError as exc:
             logger.debug("FTS rebuild chunk failed (will retry): %s", exc)
             return True  # transient (lock contention) — caller retries
@@ -1722,6 +1784,24 @@ class SessionDB:
                 status["indexed"], status["total"], status["percent"],
             )
 
+        def _pause_after_chunk(chunk_seconds: float) -> None:
+            """Adaptive worker pacing: cap duty cycle AND yield to users.
+
+            Sleep is the max of (a) the duty-cycle pause — a multiple of the
+            chunk's measured cost, so the worker never owns more than
+            ~1/(1+factor) of DB bandwidth — and (b) the foreground-yield
+            crawl pause when any non-worker write landed within the yield
+            window (a user is actively working; the rebuild can wait).
+            """
+            pause = max(
+                self._FTS_REBUILD_MIN_PAUSE,
+                chunk_seconds * self._FTS_REBUILD_DUTY_FACTOR,
+            )
+            fg_age = time.monotonic() - self._last_foreground_write_at
+            if fg_age < self._FTS_REBUILD_YIELD_WINDOW:
+                pause = max(pause, self._FTS_REBUILD_YIELD_PAUSE)
+            time.sleep(pause)
+
         def _worker():
             last_logged_pct = -10
             try:
@@ -1729,8 +1809,10 @@ class SessionDB:
                 while True:
                     if self._conn is None:  # DB closed — resume on next open
                         return
+                    _t0 = time.monotonic()
                     if not self.fts_rebuild_step():
                         break
+                    _chunk_cost = time.monotonic() - _t0
                     st = self.fts_rebuild_status()
                     if st and st["percent"] >= last_logged_pct + 10:
                         last_logged_pct = st["percent"] - (st["percent"] % 10)
@@ -1738,15 +1820,16 @@ class SessionDB:
                             "FTS index rebuild: %d%% (%d/%d messages)",
                             st["percent"], st["indexed"], st["total"],
                         )
-                    time.sleep(self._FTS_REBUILD_PAUSE_SECONDS)
+                    _pause_after_chunk(_chunk_cost)
                 # Phase 2: tear down the renamed-away v22 tables in chunks
                 # (space is then reclaimable via VACUUM / sessions optimize).
                 while True:
                     if self._conn is None:
                         return
+                    _t0 = time.monotonic()
                     if not self._fts_teardown_trash_step():
                         return
-                    time.sleep(self._FTS_REBUILD_PAUSE_SECONDS)
+                    _pause_after_chunk(time.monotonic() - _t0)
             except Exception as exc:
                 # DB closed mid-chunk (AttributeError on a None _conn) is the
                 # normal shutdown race — the teardown resumes on next open.
